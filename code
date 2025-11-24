@@ -1,0 +1,320 @@
+import pandas as pd
+import numpy as np
+import random
+import math
+import uuid
+import matplotlib.pyplot as plt
+
+#csv file uploaded
+Songs = pd.read_csv('songs.csv')
+
+# Fix possible spelling typo
+if "Counrty" in Songs.columns:
+    Songs.rename(columns={"Counrty": "Country"}, inplace=True)
+
+# Add last_t column to track when song was last recommended
+if "last_t" not in Songs.columns:
+    Songs["last_t"] = 0
+
+# Add popularity column if not present (Feature 7: trend/popularity)
+if "popularity" not in Songs.columns:
+    np.random.seed(42)
+    Songs["popularity"] = np.random.randint(40, 100, size=len(Songs))
+
+#settings
+NFEATURE = 21
+S = 50
+startConstant = 5
+totReco = 0
+
+#USERS
+users = {}
+
+def register_user():
+    name = input("Enter your name: ")
+    user_id = str(uuid.uuid4())
+    users[user_id] = {
+        "name": name,
+        "features": np.zeros(NFEATURE),
+        "rated_songs": set()
+    }
+    print(f"User {name} registered with ID: {user_id}")
+    return user_id
+
+def get_user_data(user_id):
+    return users[user_id]
+
+# FEATURES LIST
+Features = [
+    "(1980s)", "(1990s)", "(2000s)", "(2010s)", "(2020s)",
+    "Pop", "Rock", "Country", "Folk", "Dance", "Grunge",
+    "Love", "Metal", "Classic", "Funk", "Electric",
+    "Acoustic", "Indie", "Jazz", "SoundTrack", "Rap"
+]
+
+# Ensure they exist in CSV
+assert all([col in Songs.columns for col in Features]), "Feature names mismatch with CSV!"
+
+# MOOD SYSTEM (Feature 1)
+MOOD_FEATURE_MAP = {
+    "Happy": ["Pop", "Dance", "Love"],
+    "Energetic": ["Dance", "Rock", "Metal", "Rap"],
+    "Calm": ["Acoustic", "Indie", "Jazz"],
+    "Sad": ["Classic", "Acoustic", "Indie"]
+}
+
+def build_mood_vector(mood_name):
+    """Create a vector aligned with Features, boosted for mood-related features."""
+    vec = np.zeros(NFEATURE)
+    if mood_name not in MOOD_FEATURE_MAP:
+        return vec
+    mood_feats = MOOD_FEATURE_MAP[mood_name]
+    for i, ft in enumerate(Features):
+        if ft in mood_feats:
+            vec[i] = 1.0
+    # normalize if any
+    if vec.sum() > 0:
+        vec = vec / vec.sum()
+    return vec
+
+# FEATURE & UTILITY FUNCTIONS
+def get_song_features(song_row):
+    return song_row[Features].values.astype(float)
+
+def compute_utility(user_features, song_features, epoch, s, mood_vector=None, popularity_score=None):
+    """
+    Base utility from user-song similarity + mood alignment + popularity.
+    """
+    # Base RL-style utility
+    dot = np.dot(user_features, song_features)
+    ee = 1 - math.exp(-max(epoch, 0) / s)
+    base_util = dot * ee
+
+    mood_bonus = 0.0
+    if mood_vector is not None:
+        mood_bonus = np.dot(mood_vector, song_features)  # higher if song matches mood
+
+    pop_bonus = 0.0
+    if popularity_score is not None:
+        pop_norm = popularity_score / 100.0  # assuming 0–100 scale
+        pop_bonus = pop_norm
+
+    total = base_util + 0.4 * mood_bonus + 0.3 * pop_bonus
+    return total
+
+
+# RECOMMENDATION METHODS
+def random_choice(ratedSongs):
+    song = Songs.sample()
+    while song.index[0] in ratedSongs:
+        song = Songs.sample()
+    return song
+
+def best_recommendation(user_features, epoch, s, mood_vector, ratedSongs):
+    utilities = []
+
+    for idx, row in Songs.iterrows():
+        song_features = get_song_features(row)
+        last_t = row["last_t"]
+        util = compute_utility(
+            user_features,
+            song_features,
+            epoch - last_t,
+            s,
+            mood_vector=mood_vector,
+            popularity_score=row["popularity"]
+        )
+        utilities.append(util)
+
+    idx_max = np.argmax(utilities)
+    return Songs.iloc[[idx_max]]
+
+def greedy_choice(user_features, epoch, s, ratedSongs, mood_vector):
+    global totReco
+    totReco += 1
+    epsilon = 1 / math.sqrt(epoch + 1)
+
+    if random.random() > epsilon:
+        return best_recommendation(user_features, epoch, s, mood_vector, ratedSongs)
+    else:
+        return random_choice(ratedSongs)
+
+def greedy_choice_no_t(user_features, epoch, s, ratedSongs, mood_vector, epsilon=0.3):
+    global totReco
+    totReco += 1
+
+    if random.random() > epsilon:
+        return best_recommendation(user_features, epoch, s, mood_vector, ratedSongs)
+    else:
+        return random_choice(ratedSongs)
+
+
+def iterative_mean(old, new, t):
+    t += startConstant
+    return ((t - 1) / t) * old + (1 / t) * new
+
+def update_features(user_features, song_features, rating, t):
+    return iterative_mean(user_features, song_features * rating, t + 1)
+
+
+#visualization
+def visualize_user_vs_playlist(user_vec, playlist_indices):
+    """
+    Plots a bar chart comparing user preference vector vs
+    average features of the recommended playlist.
+    """
+    if len(playlist_indices) == 0:
+        print("No songs to visualize.")
+        return
+
+    playlist_vec = np.zeros_like(user_vec)
+    for idx in playlist_indices:
+        row = Songs.loc[idx]
+        playlist_vec += get_song_features(row)
+    playlist_vec = playlist_vec / len(playlist_indices)
+
+    x = np.arange(len(Features))
+    plt.figure(figsize=(14, 6))
+    plt.bar(x - 0.2, user_vec, width=0.4, label='User Preference')
+    plt.bar(x + 0.2, playlist_vec, width=0.4, label='Playlist Avg Features')
+    plt.xticks(x, Features, rotation=60)
+    plt.ylabel("Feature Intensity (normalized)")
+    plt.title("User Profile vs Recommended Playlist Feature Profile")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+# REINFORCEMENT LEARNING LOOP
+def reinforcement_learning(user_id, s=200, N=5):
+    global Songs
+
+    data = get_user_data(user_id)
+    user_features = data["features"]
+    ratedSongs = data["rated_songs"]
+
+    # 1) Ask for Mood (Feature 1)
+    print("Select your current mood:\n")
+    mood_options = ["Happy", "Sad", "Energetic", "Calm"]
+    for i, m in enumerate(mood_options):
+        print(f"{i+1}. {m}")
+    mood_choice = int(input("Enter mood number: "))
+    mood_name = mood_options[mood_choice - 1]
+    mood_vector = build_mood_vector(mood_name)
+    print(f"\nMood selected: {mood_name}\n")
+
+    # 2) Ask for liked features
+    print("Select the features you like:\n")
+    for i, ft in enumerate(Features):
+        print(f"{i+1}. {ft}")
+
+    liked = []
+    choice = "y"
+
+    while choice.lower() == "y":
+        num = int(input("Enter feature number: "))
+        liked.append(Features[num - 1])
+        choice = input("Add another? (y/n): ")
+
+    # Set user preferences vector
+    for i, ft in enumerate(Features):
+        if ft in liked:
+            user_features[i] = 1 / len(liked)
+
+    print(f"\nRate {N} songs so we can learn your taste.\n")
+
+    # 3) Rating phase (initial learning)
+    for t in range(N):
+        if t >= 10:
+            rec = greedy_choice_no_t(user_features, t+1, s, ratedSongs, mood_vector)
+        else:
+            rec = greedy_choice(user_features, t+1, s, ratedSongs, mood_vector)
+
+        name = rec.iloc[0]["Title"]
+        song_features = get_song_features(rec.iloc[0])
+
+        rating = float(input(f'Rate "{name}" (1-10): ')) / 10.0
+
+        user_features = update_features(user_features, song_features, rating, t)
+        ratedSongs.add(rec.index[0])
+
+        Songs.loc[rec.index[0], "last_t"] = t + 1
+
+        data["features"] = user_features
+        data["rated_songs"] = ratedSongs
+
+    # 4) First playlist (10 unique recommendations)
+    print("\nHere is your first recommended playlist:\n")
+
+    recommended_indices = set()
+    count = 0
+
+    while count < 10:
+        rec = greedy_choice_no_t(user_features, count+1, s, ratedSongs, mood_vector)
+        song_index = rec.index[0]
+
+        if song_index in recommended_indices:
+            continue  # skip duplicates
+
+        recommended_indices.add(song_index)
+        print(f"{count+1}. {rec.iloc[0]['Title']}")
+        count += 1
+
+    # 5) Skip simulation + continuous learning (Feature 4)
+    print("\nSimulating skips based on your learned preferences...\n")
+    simulated_skips = 0
+    t_skip = 0
+
+    for idx in list(recommended_indices):
+        row = Songs.loc[idx]
+        song_features = get_song_features(row)
+
+        util = compute_utility(
+            user_features,
+            song_features,
+            epoch=10,
+            s=S,
+            mood_vector=mood_vector,
+            popularity_score=row["popularity"]
+        )
+
+        # If utility low, simulate skip; else like
+        if util < 0.2:
+            rating = 0.2
+            simulated_skips += 1
+        else:
+            rating = 0.8
+
+        user_features = update_features(user_features, song_features, rating, t_skip)
+        t_skip += 1
+
+    print(f"Simulated {simulated_skips} skips. Updating your profile...\n")
+
+    # 6) Refined playlist after "learning from skips"
+    print("Refined playlist after learning from skips:\n")
+
+    refined_indices = set()
+    count = 0
+
+    while count < 10:
+        rec = greedy_choice_no_t(user_features, count+1, s, ratedSongs, mood_vector)
+        song_index = rec.index[0]
+
+        if song_index in refined_indices:
+            continue
+
+        refined_indices.add(song_index)
+        print(f"{count+1}. {rec.iloc[0]['Title']}")
+        count += 1
+
+    # 7) Visualization (Feature 8)
+    print("\nVisualizing your profile vs refined playlist feature distribution...\n")
+    visualize_user_vs_playlist(user_features, list(refined_indices))
+
+
+# MAIN
+def main():
+    user_id = register_user()
+    reinforcement_learning(user_id)
+
+main()
